@@ -30,8 +30,7 @@ def generate_maya_response(
         enriched = list(messages)
         enriched.insert(1, {
             "role": "system",
-            "content": f"[Lead context - do not mention explicitly]
-{lead_context}"
+            "content": f"[Lead context - do not mention explicitly]\n{lead_context}"
         })
     else:
         enriched = messages
@@ -54,12 +53,9 @@ def generate_maya_response(
 
 
 def wrap_reply_in_html(text: str) -> str:
-    paragraphs = [p.strip() for p in text.split("
-
-") if p.strip()]
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     html_parts = [
-        "".join(f"<p>{line}</p>" for line in p.split("
-") if line)
+        "".join(f"<p>{line}</p>" for line in p.split("\n") if line)
         for p in paragraphs
     ]
     return (
