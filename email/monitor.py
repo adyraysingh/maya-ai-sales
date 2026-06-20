@@ -1,84 +1,106 @@
 """
-email/monitor.py - Poll maya@makeyourlabel.com inbox for new replies from prospects
-Uses Microsoft Graph delta query to detect only new unread messages.
+email/monitor.py - Poll maya@makeyourlabel.com Gmail inbox via IMAP every 60 seconds
 """
 
+import imaplib
+import email
+import time
 import logging
-import re
-from typing import Optional
+from email.header import decode_header
 from config import settings
-from .graph_client import graph_get, graph_patch
 
 logger = logging.getLogger(__name__)
 
-_delta_token: Optional[str] = None
+SEEN_UIDS_FILE = "/tmp/maya_seen_uids.txt"
 
 
-def get_unread_messages() -> list:
-      """Fetch unread messages from Maya inbox. Returns list of message dicts."""
-      global _delta_token
-      user_id = settings.maya_email
+def _load_seen_uids() -> set:
+          try:
+                        with open(SEEN_UIDS_FILE, "r") as f:
+                                          return set(line.strip() for line in f if line.strip())
+          except FileNotFoundError:
+                        return set()
 
-    select_fields = (
-              "id,subject,from,toRecipients,receivedDateTime,"
-              "body,conversationId,internetMessageId"
-    )
 
-    if _delta_token:
-              endpoint = f"users/{user_id}/mailFolders/Inbox/messages/delta"
-              params = {"$deltaToken": _delta_token}
+def _save_seen_uid(uid: str):
+          with open(SEEN_UIDS_FILE, "a") as f:
+                        f.write(uid + "\n")
+
+
+def _decode_header_value(value: str) -> str:
+          parts = decode_header(value)
+          decoded = []
+          for part, charset in parts:
+                        if isinstance(part, bytes):
+                                          decoded.append(part.decode(charset or "utf-8", errors="replace"))
 else:
-          endpoint = f"users/{user_id}/mailFolders/Inbox/messages/delta"
-          params = {"$filter": "isRead eq false", "$select": select_fields, "$top": "20"}
+            decoded.append(part)
+          return " ".join(decoded)
 
+
+def _get_body(msg) -> str:
+          if msg.is_multipart():
+                        for part in msg.walk():
+                                          ctype = part.get_content_type()
+                                          disp = str(part.get("Content-Disposition", ""))
+                                          if ctype == "text/plain" and "attachment" not in disp:
+                                                                return part.get_payload(decode=True).decode("utf-8", errors="replace")
+                                                        for part in msg.walk():
+                                                                          if part.get_content_type() == "text/html":
+                                                                                                return part.get_payload(decode=True).decode("utf-8", errors="replace")
+          else:
+                        return msg.get_payload(decode=True).decode("utf-8", errors="replace")
+                    return ""
+
+
+def fetch_new_emails() -> list:
+          results = []
+    seen_uids = _load_seen_uids()
     try:
-              data = graph_get(endpoint, params=params)
-              messages = data.get("value", [])
-
-        delta_link = data.get("@odata.deltaLink", "")
-        if delta_link and "$deltaToken=" in delta_link:
-                      _delta_token = delta_link.split("$deltaToken=")[-1]
-
-        incoming = []
-        for msg in messages:
-                      sender_addr = msg.get("from", {}).get("emailAddress", {}).get("address", "")
-                      if sender_addr.lower() != settings.maya_email.lower():
-                                        incoming.append(msg)
-                                        _mark_as_read(user_id, msg["id"])
-
-                  logger.info(f"Found {len(incoming)} new prospect messages.")
-        return incoming
-
+                  mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+                  mail.login(settings.MAYA_EMAIL, settings.GMAIL_APP_PASSWORD)
+                  mail.select("INBOX")
+                  status, data = mail.search(None, "UNSEEN")
+                  if status != "OK":
+                                    return []
+                                for uid in data[0].split():
+                                                  uid_str = uid.decode()
+                                                  if uid_str in seen_uids:
+                                                                        continue
+                                                                    status, msg_data = mail.fetch(uid, "(RFC822)")
+            if status != "OK":
+                                  continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            from_raw = msg.get("From", "")
+            from_email = email.utils.parseaddr(from_raw)[1].lower()
+            from_name = _decode_header_value(email.utils.parseaddr(from_raw)[0] or from_raw)
+            subject = _decode_header_value(msg.get("Subject", "(no subject)"))
+            message_id = msg.get("Message-ID", "")
+            body = _get_body(msg)
+            if from_email == settings.MAYA_EMAIL.lower():
+                                  _save_seen_uid(uid_str)
+                continue
+            _save_seen_uid(uid_str)
+            results.append({
+                                  "from_email": from_email,
+                                  "from_name": from_name,
+                                  "subject": subject,
+                                  "body": body.strip(),
+                                  "message_id": message_id,
+            })
+        mail.logout()
 except Exception as e:
-        logger.error(f"Error polling inbox: {e}")
-        return []
+        logger.error(f"IMAP fetch error: {e}")
+    return results
 
 
-def _mark_as_read(user_id: str, message_id: str) -> None:
-      try:
-                graph_patch(f"users/{user_id}/messages/{message_id}", {"isRead": True})
-except Exception as e:
-        logger.warning(f"Could not mark message {message_id} as read: {e}")
-
-
-def extract_message_body(message: dict) -> str:
-      """Extract clean plain text from Graph message body."""
-      body = message.get("body", {})
-      content = body.get("content", "")
-      if body.get("contentType", "").lower() == "html":
-                content = re.sub(r"<[^>]+>", " ", content)
-                content = re.sub(r"&nbsp;", " ", content)
-                content = re.sub(r"\s+", " ", content).strip()
-            return content
-
-
-def get_sender_email(message: dict) -> str:
-      return message.get("from", {}).get("emailAddress", {}).get("address", "")
-
-
-def get_sender_name(message: dict) -> str:
-      return message.get("from", {}).get("emailAddress", {}).get("name", "")
-
-
-def get_message_id(message: dict) -> str:
-      return message.get("internetMessageId", message.get("id", ""))
+def start_inbox_monitor(callback):
+          logger.info("Starting Gmail IMAP inbox monitor (60s polling)...")
+    while True:
+                  try:
+                                    for email_data in fetch_new_emails():
+                                                          logger.info(f"New email from {email_data['from_email']}")
+                                                          callback(email_data)
+                  except Exception as e:
+            logger.error(f"Monitor loop error: {e}")
+        time.sleep(60)
