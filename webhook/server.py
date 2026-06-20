@@ -1,11 +1,12 @@
 """
-webhook/server.py - FastAPI app entry point
+webhook/server.py - FastAPI app + inbox monitor thread
 """
 
+import os
+import sys
 import logging
 import threading
-import importlib
-import sys
+import importlib.util
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
@@ -15,49 +16,64 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Resolve repo root (one level up from webhook/)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_module(name, path):
+    """Load a Python file as a module by absolute path."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 
 def _run_inbox_monitor():
-    """Import and run the inbox monitor in a background thread."""
-    # Use importlib to avoid conflict with Python's built-in email module
-    monitor = importlib.import_module("email.monitor")
-    from ai.response import generate_maya_response, wrap_reply_in_html
-    from email_module.sender import send_email
+    """Background thread: poll Gmail inbox and reply with Maya."""
+    try:
+        monitor = _load_module("mail_monitor", os.path.join(ROOT, "email", "monitor.py"))
+        sender = _load_module("mail_sender", os.path.join(ROOT, "email", "sender.py"))
 
-    def on_new_email(email_data: dict):
-        try:
-            from_email = email_data["from_email"]
-            from_name = email_data["from_name"]
-            subject = email_data["subject"]
-            body = email_data["body"]
-            message_id = email_data.get("message_id", "")
+        from ai.response import generate_maya_response, wrap_reply_in_html
 
-            reply_text = generate_maya_response(
-                prospect_email=from_email,
-                prospect_message=body,
-            )
-            reply_html = wrap_reply_in_html(reply_text)
+        def on_new_email(email_data: dict):
+            try:
+                from_email = email_data["from_email"]
+                from_name = email_data["from_name"]
+                subject = email_data["subject"]
+                body = email_data["body"]
+                message_id = email_data.get("message_id", "")
 
-            re_subject = subject if subject.startswith("Re:") else f"Re: {subject}"
-            send_email(
-                to_email=from_email,
-                to_name=from_name,
-                subject=re_subject,
-                body_html=reply_html,
-                reply_to_message_id=message_id,
-            )
-            logger.info(f"Reply sent to {from_email}")
-        except Exception as e:
-            logger.error(f"Error handling email from {email_data.get('from_email')}: {e}")
+                reply_text = generate_maya_response(
+                    prospect_email=from_email,
+                    prospect_message=body,
+                )
+                reply_html = wrap_reply_in_html(reply_text)
+                re_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+                sender.send_email(
+                    to_email=from_email,
+                    to_name=from_name,
+                    subject=re_subject,
+                    body_html=reply_html,
+                    reply_to_message_id=message_id,
+                )
+                logger.info(f"Reply sent to {from_email}")
+            except Exception as exc:
+                logger.error(f"Error handling email: {exc}")
 
-    monitor.start_inbox_monitor(on_new_email)
+        monitor.start_inbox_monitor(on_new_email)
+
+    except Exception as exc:
+        logger.error(f"Inbox monitor failed to start: {exc}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Maya AI Sales Engine starting up...")
+    logger.info("Maya AI Sales Engine starting...")
     t = threading.Thread(target=_run_inbox_monitor, daemon=True)
     t.start()
-    logger.info("Inbox monitor thread started (polling every 60s).")
+    logger.info("Inbox monitor thread started (60s polling).")
     yield
     logger.info("Maya AI Sales Engine shutting down.")
 
